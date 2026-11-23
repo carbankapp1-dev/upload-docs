@@ -2,13 +2,39 @@ const express = require('express');
 const multer = require('multer');
 const archiver = require('archiver');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const {
+  S3Client, ListObjectsV2Command, HeadObjectCommand, GetObjectCommand,
+  PutObjectCommand, DeleteObjectsCommand,
+} = require('@aws-sdk/client-s3');
+const { Upload } = require('@aws-sdk/lib-storage');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const PORT = process.env.PORT || 3000;
-const STORAGE = path.resolve(process.env.STORAGE_DIR || path.join(__dirname, 'uploads'));
-const TMP = path.join(STORAGE, '.tmp');
-fs.mkdirSync(TMP, { recursive: true });
+
+// ---------- Cloudflare R2 ----------
+const { R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET } = process.env;
+const R2_ENDPOINT = process.env.R2_ENDPOINT || (R2_ACCOUNT_ID && `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`);
+if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
+  console.error('Configure R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY e R2_BUCKET (veja o README).');
+  process.exit(1);
+}
+const s3 = new S3Client({
+  region: 'auto',
+  endpoint: R2_ENDPOINT,
+  forcePathStyle: true,
+  // Recomendado para o R2: só calcula checksums quando obrigatório
+  requestChecksumCalculation: 'WHEN_REQUIRED',
+  responseChecksumValidation: 'WHEN_REQUIRED',
+  credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
+});
+const Bucket = R2_BUCKET;
+const KEEP = '.keep'; // marcador para pastas vazias
+
+// Limpeza automática: apaga arquivos com mais de CLEANUP_DAYS dias (0 desliga)
+const CLEANUP_DAYS = Number(process.env.CLEANUP_DAYS ?? 2);
 
 // ---------- Login ----------
 // Usuários no formato "usuario:senha,outro:senha2" (variável USERS)
@@ -21,29 +47,29 @@ const USERS = {};
 if (process.env.ADMIN_USER && process.env.ADMIN_PASSWORD) USERS[process.env.ADMIN_USER] = process.env.ADMIN_PASSWORD;
 if (!Object.keys(USERS).length) {
   USERS.admin = 'admin123';
-  console.warn('AVISO: nenhum usuário configurado. Usando admin / admin123 — defina USERS ou ADMIN_USER/ADMIN_PASSWORD!');
+  console.warn('AVISO: nenhum usuário configurado. Usando admin / admin123 — defina USERS!');
 }
 const SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
-const SESSION_DAYS = 7;
+if (!process.env.SESSION_SECRET) console.warn('AVISO: defina SESSION_SECRET para o login não cair quando o servidor reiniciar.');
 
-const sign = v => crypto.createHmac('sha256', SECRET).update(v).digest('base64url');
-const safeEq = (a, b) => {
-  const ha = crypto.createHash('sha256').update(String(a)).digest();
-  const hb = crypto.createHash('sha256').update(String(b)).digest();
-  return crypto.timingSafeEqual(ha, hb);
-};
-function makeToken(user) {
-  const v = Buffer.from(user).toString('base64url') + '.' + (Date.now() + SESSION_DAYS * 864e5);
-  return v + '.' + sign(v);
-}
+const hasUser = u => Object.prototype.hasOwnProperty.call(USERS, u);
+// A assinatura inclui a senha: trocar a senha de um usuário desloga ele.
+const sign = u => crypto.createHmac('sha256', SECRET).update(u + '\0' + USERS[u]).digest('base64url');
+const safeEq = (a, b) => crypto.timingSafeEqual(
+  crypto.createHash('sha256').update(String(a)).digest(),
+  crypto.createHash('sha256').update(String(b)).digest());
+
+// O login não expira: só sai clicando em "Sair" (ou se a senha/SESSION_SECRET mudar)
+const makeToken = user => Buffer.from(user).toString('base64url') + '.' + sign(user);
 function readToken(req) {
   const m = (req.headers.cookie || '').match(/(?:^|;\s*)sess=([^;]+)/);
   if (!m) return null;
-  const [u, exp, sig] = m[1].split('.');
-  if (!sig || !safeEq(sig, sign(u + '.' + exp)) || Date.now() > +exp) return null;
+  const [u, sig] = m[1].split('.');
+  if (!sig) return null;
   const user = Buffer.from(u, 'base64url').toString();
-  return Object.prototype.hasOwnProperty.call(USERS, user) ? user : null;
+  return hasUser(user) && safeEq(sig, sign(user)) ? user : null;
 }
+const COOKIE_MAX_AGE = 10 * 365 * 864e5; // ~10 anos
 
 // Limite simples de tentativas por IP (10 a cada 15 min)
 const attempts = new Map();
@@ -55,19 +81,18 @@ function tooMany(ip) {
 
 const app = express();
 app.set('trust proxy', 1);
-app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
 app.post('/api/login', (req, res) => {
   const ip = req.ip;
   if (tooMany(ip)) return res.status(429).json({ error: 'Muitas tentativas. Aguarde 15 minutos.' });
   const { user = '', password = '' } = req.body || {};
-  const ok = Object.prototype.hasOwnProperty.call(USERS, user) && safeEq(password, USERS[user]);
-  if (!ok) { attempts.get(ip).n++; return res.status(401).json({ error: 'Usuário ou senha incorretos' }); }
+  if (!hasUser(user) || !safeEq(password, USERS[user])) {
+    attempts.get(ip).n++;
+    return res.status(401).json({ error: 'Usuário ou senha incorretos' });
+  }
   attempts.delete(ip);
-  res.cookie('sess', makeToken(user), {
-    httpOnly: true, sameSite: 'lax', secure: req.secure, maxAge: SESSION_DAYS * 864e5
-  });
+  res.cookie('sess', makeToken(user), { httpOnly: true, sameSite: 'lax', secure: req.secure, maxAge: COOKIE_MAX_AGE });
   res.json({ ok: true });
 });
 app.post('/api/logout', (req, res) => { res.clearCookie('sess'); res.json({ ok: true }); });
@@ -82,106 +107,181 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Não autenticado' });
   res.redirect('/login.html');
 });
-app.get('/api/me', (req, res) => res.json({ user: req.user }));
+app.get('/api/me', (req, res) => res.json({ user: req.user, cleanupDays: CLEANUP_DAYS }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Resolve um caminho relativo dentro de STORAGE, bloqueando "../"
-function safePath(rel = '') {
-  const clean = String(rel).replace(/\\/g, '/').split('/')
-    .filter(p => p && p !== '.' && p !== '..' && p !== '.tmp').join('/');
-  const full = path.resolve(STORAGE, clean);
-  if (full !== STORAGE && !full.startsWith(STORAGE + path.sep)) throw new Error('Caminho inválido');
-  return { full, clean };
+// ---------- Helpers de armazenamento ----------
+// Normaliza um caminho relativo ("a/b/c.txt"), bloqueando "../"
+function clean(rel = '') {
+  return String(rel).replace(/\\/g, '/').split('/')
+    .filter(p => p && p !== '.' && p !== '..').join('/');
 }
+const prefixOf = dir => (dir ? dir + '/' : '');
 
+async function exists(Key) {
+  try { await s3.send(new HeadObjectCommand({ Bucket, Key })); return true; }
+  catch (e) { if (e.$metadata?.httpStatusCode === 404 || e.name === 'NotFound') return false; throw e; }
+}
 // Evita sobrescrever: "foto.png" -> "foto (1).png"
-function uniqueName(full) {
-  if (!fs.existsSync(full)) return full;
-  const { dir, name, ext } = path.parse(full);
-  let i = 1;
-  while (fs.existsSync(path.join(dir, `${name} (${i})${ext}`))) i++;
-  return path.join(dir, `${name} (${i})${ext}`);
+async function uniqueKey(Key) {
+  if (!(await exists(Key))) return Key;
+  const dir = path.posix.dirname(Key), ext = path.posix.extname(Key), name = path.posix.basename(Key, ext);
+  for (let i = 1; ; i++) {
+    const k = (dir === '.' ? '' : dir + '/') + `${name} (${i})${ext}`;
+    if (!(await exists(k))) return k;
+  }
 }
+// Todos os objetos sob um prefixo (com paginação)
+async function listAll(Prefix) {
+  const out = []; let ContinuationToken;
+  do {
+    const r = await s3.send(new ListObjectsV2Command({ Bucket, Prefix, ContinuationToken }));
+    out.push(...(r.Contents || []));
+    ContinuationToken = r.IsTruncated ? r.NextContinuationToken : undefined;
+  } while (ContinuationToken);
+  return out;
+}
+async function deleteKeys(keys) {
+  for (let i = 0; i < keys.length; i += 1000) {
+    await s3.send(new DeleteObjectsCommand({
+      Bucket, Delete: { Objects: keys.slice(i, i + 1000).map(Key => ({ Key })), Quiet: true },
+    }));
+  }
+}
+const contentDisposition = name =>
+  `attachment; filename="${name.replace(/[^\x20-\x7e]|"/g, '_')}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 
-const upload = multer({ dest: TMP, limits: { fileSize: 5 * 1024 * 1024 * 1024 } });
+// ---------- Rotas ----------
+const upload = multer({ dest: path.join(os.tmpdir(), 'uploads-tmp'), limits: { fileSize: 5 * 1024 * 1024 * 1024 } });
 
 // Upload: campo "files" + campo "paths" (caminho relativo de cada arquivo, para pastas)
-app.post('/api/upload', upload.array('files'), (req, res) => {
+app.post('/api/upload', upload.array('files'), async (req, res) => {
   try {
-    const base = safePath(req.query.dir).full;
+    const base = clean(req.query.dir);
     const paths = [].concat(req.body.paths || []);
-    req.files.forEach((f, i) => {
-      const rel = paths[i] || Buffer.from(f.originalname, 'latin1').toString('utf8');
-      const dest = uniqueName(path.join(base, safePath(rel).clean));
-      if (!dest.startsWith(STORAGE + path.sep)) throw new Error('Caminho inválido');
-      fs.mkdirSync(path.dirname(dest), { recursive: true });
-      fs.renameSync(f.path, dest);
-    });
+    for (let i = 0; i < req.files.length; i++) {
+      const f = req.files[i];
+      const rel = clean(paths[i] || f.originalname);
+      if (!rel) continue;
+      const Key = await uniqueKey(prefixOf(base) + rel);
+      await new Upload({
+        client: s3,
+        params: { Bucket, Key, Body: fs.createReadStream(f.path), ContentLength: f.size, ContentType: f.mimetype || 'application/octet-stream' },
+      }).done();
+    }
     res.json({ ok: true, count: req.files.length });
   } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erro ao salvar arquivos' });
+  } finally {
     (req.files || []).forEach(f => fs.rm(f.path, { force: true }, () => {}));
-    res.status(400).json({ error: e.message });
   }
 });
 
 // Lista o conteúdo de uma pasta
-app.get('/api/list', (req, res) => {
+app.get('/api/list', async (req, res) => {
   try {
-    const { full, clean } = safePath(req.query.dir);
-    const items = fs.readdirSync(full, { withFileTypes: true })
-      .filter(d => d.name !== '.tmp')
-      .map(d => {
-        const st = fs.statSync(path.join(full, d.name));
-        return { name: d.name, isDir: d.isDirectory(), size: st.size, mtime: st.mtimeMs };
-      })
-      .sort((a, b) => (b.isDir - a.isDir) || a.name.localeCompare(b.name, 'pt-BR'));
-    res.json({ dir: clean, items });
+    const dir = clean(req.query.dir);
+    const Prefix = prefixOf(dir);
+    const items = []; let ContinuationToken;
+    do {
+      const r = await s3.send(new ListObjectsV2Command({ Bucket, Prefix, Delimiter: '/', ContinuationToken }));
+      (r.CommonPrefixes || []).forEach(p =>
+        items.push({ name: p.Prefix.slice(Prefix.length, -1), isDir: true, size: 0, mtime: null }));
+      (r.Contents || []).forEach(o => {
+        const name = o.Key.slice(Prefix.length);
+        if (name && name !== KEEP) items.push({ name, isDir: false, size: o.Size, mtime: +o.LastModified });
+      });
+      ContinuationToken = r.IsTruncated ? r.NextContinuationToken : undefined;
+    } while (ContinuationToken);
+    items.sort((a, b) => (b.isDir - a.isDir) || a.name.localeCompare(b.name, 'pt-BR'));
+    res.json({ dir, items });
   } catch (e) {
-    res.status(404).json({ error: 'Pasta não encontrada' });
+    console.error(e);
+    res.status(500).json({ error: 'Erro ao listar' });
   }
 });
 
-// Download de arquivo, ou de pasta como .zip
-app.get('/api/download', (req, res) => {
-  let target;
-  try { target = safePath(req.query.path); } catch { return res.sendStatus(400); }
-  if (!target.clean || !fs.existsSync(target.full)) return res.sendStatus(404);
+// Download de arquivo (link temporário direto do R2), ou de pasta como .zip
+app.get('/api/download', async (req, res) => {
+  const p = clean(req.query.path);
+  if (!p) return res.sendStatus(400);
+  try {
+    if (await exists(p)) {
+      const url = await getSignedUrl(s3, new GetObjectCommand({
+        Bucket, Key: p, ResponseContentDisposition: contentDisposition(path.posix.basename(p)),
+      }), { expiresIn: 300 });
+      return res.redirect(url);
+    }
+    const objs = (await listAll(p + '/')).filter(o => path.posix.basename(o.Key) !== KEEP);
+    if (!objs.length) return res.sendStatus(404);
 
-  if (fs.statSync(target.full).isDirectory()) {
-    const name = path.basename(target.full) + '.zip';
-    res.attachment(name);
+    const folder = path.posix.basename(p);
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', contentDisposition(folder + '.zip'));
     const zip = archiver('zip', { zlib: { level: 6 } });
-    zip.on('error', () => res.end());
+    zip.on('error', e => { console.error(e); res.end(); });
     zip.pipe(res);
-    zip.directory(target.full, path.basename(target.full));
+    // Um arquivo por vez, para não abrir muitas conexões ao R2
+    for (const o of objs) {
+      const { Body } = await s3.send(new GetObjectCommand({ Bucket, Key: o.Key }));
+      await new Promise((resolve, reject) => {
+        zip.once('entry', resolve);
+        Body.once('error', reject);
+        zip.append(Body, { name: folder + '/' + o.Key.slice(p.length + 1), date: o.LastModified });
+      });
+    }
     zip.finalize();
-  } else {
-    res.download(target.full);
+  } catch (e) {
+    console.error(e);
+    if (!res.headersSent) res.sendStatus(500); else res.end();
   }
 });
 
 // Excluir arquivo ou pasta
-app.delete('/api/delete', (req, res) => {
+app.delete('/api/delete', async (req, res) => {
+  const p = clean(req.query.path);
+  if (!p) return res.sendStatus(400);
   try {
-    const { full, clean } = safePath(req.query.path);
-    if (!clean) return res.sendStatus(400);
-    fs.rmSync(full, { recursive: true, force: true });
+    const keys = (await listAll(p + '/')).map(o => o.Key);
+    if (await exists(p)) keys.push(p);
+    await deleteKeys(keys);
     res.json({ ok: true });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    console.error(e);
+    res.status(500).json({ error: 'Erro ao excluir' });
   }
 });
 
-// Criar pasta
-app.post('/api/mkdir', (req, res) => {
+// Criar pasta (no R2 pastas não existem sozinhas: guardamos um marcador .keep)
+app.post('/api/mkdir', async (req, res) => {
+  const p = clean(req.query.path);
+  if (!p) return res.sendStatus(400);
   try {
-    const { full, clean } = safePath(req.query.path);
-    if (!clean) return res.sendStatus(400);
-    fs.mkdirSync(full, { recursive: true });
+    await s3.send(new PutObjectCommand({ Bucket, Key: p + '/' + KEEP, Body: '' }));
     res.json({ ok: true });
   } catch (e) {
-    res.status(400).json({ error: e.message });
+    console.error(e);
+    res.status(500).json({ error: 'Erro ao criar pasta' });
   }
 });
+
+// ---------- Limpeza automática ----------
+async function cleanup() {
+  try {
+    const limit = Date.now() - CLEANUP_DAYS * 864e5;
+    const old = (await listAll('')).filter(o => +o.LastModified < limit).map(o => o.Key);
+    if (old.length) {
+      await deleteKeys(old);
+      console.log(`Limpeza: ${old.length} arquivo(s) com mais de ${CLEANUP_DAYS} dia(s) apagado(s).`);
+    }
+  } catch (e) {
+    console.error('Erro na limpeza:', e.message);
+  }
+}
+if (CLEANUP_DAYS > 0) {
+  cleanup();
+  setInterval(cleanup, 60 * 60e3); // verifica a cada hora
+}
 
 app.listen(PORT, () => console.log(`Servidor rodando em http://localhost:${PORT}`));

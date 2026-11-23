@@ -69,6 +69,8 @@
   .dropzone > svg { color: var(--verde); margin-bottom: 8px; }
   .dropzone h2 { font-size: 1.1rem; color: var(--azul); font-weight: 600; }
   .dropzone p { color: var(--texto-suave); font-size: .9rem; margin: 4px 0 18px; }
+  .aviso { font-size: .8rem !important; color: var(--azul) !important; background: rgba(70, 218, 134, .12); display: inline-block; padding: 4px 12px; border-radius: 99px; margin-top: -8px !important; }
+  .aviso[hidden] { display: none; }
   .btns { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
 
   .btn {
@@ -163,6 +165,7 @@
       <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14.9A7 7 0 1 1 15.7 8h1.8a4.5 4.5 0 0 1 2.5 8.2"/><path d="M12 12v9"/><path d="m16 16-4-4-4 4"/></svg>
       <h2>Arraste arquivos ou pastas aqui</h2>
       <p>ou escolha abaixo — serão enviados para a pasta atual</p>
+      <p class="aviso" id="aviso" hidden></p>
       <div class="btns">
         <button class="btn btn-verde" onclick="fileInput.click()">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
@@ -231,7 +234,14 @@ async function logout() {
   location.href = '/login.html';
 }
 fetch('/api/me').then(r => r.ok ? r.json() : (location.href = '/login.html'))
-  .then(d => d && ($('userName').textContent = 'Olá, ' + d.user));
+  .then(d => {
+    if (!d) return;
+    $('userName').textContent = 'Olá, ' + d.user;
+    if (d.cleanupDays > 0) {
+      $('aviso').textContent = `Os arquivos são apagados automaticamente após ${d.cleanupDays} dia(s)`;
+      $('aviso').hidden = false;
+    }
+  });
 
 /* ---------- Listagem ---------- */
 async function load(dir = currentDir) {
@@ -252,7 +262,7 @@ async function load(dir = currentDir) {
       <div class="icon ${it.isDir ? 'dir' : ''}">${it.isDir ? ICONS.folder : ICONS.file}</div>
       <div class="file-info">
         <div class="file-name ${it.isDir ? 'clickable' : ''}" ${it.isDir ? `data-open="${p}"` : ''} title="${esc(it.name)}">${esc(it.name)}</div>
-        <div class="file-meta">${it.isDir ? 'Pasta' : fmtSize(it.size)} · ${fmtDate(it.mtime)}</div>
+        <div class="file-meta">${it.isDir ? 'Pasta' : fmtSize(it.size) + ' · ' + fmtDate(it.mtime)}</div>
       </div>
       <div class="actions">
         <button class="icon-btn" title="${it.isDir ? 'Baixar pasta (.zip)' : 'Baixar'}" data-dl="${p}">${ICONS.download}</button>
