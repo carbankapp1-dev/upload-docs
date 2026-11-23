@@ -1,0 +1,22 @@
+name: Manutenção (limpeza + manter Supabase ativo)
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'   # a cada 6 horas
+  workflow_dispatch:          # permite rodar manualmente pela aba Actions
+
+jobs:
+  manutencao:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci --omit=dev
+      - run: node scripts/manutencao.js
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_BUCKET: ${{ secrets.SUPABASE_BUCKET }}
+          CLEANUP_DAYS: '2'
