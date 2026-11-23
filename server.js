@@ -61,6 +61,7 @@ function tooMany(ip) {
 const app = express();
 app.set('trust proxy', 1);
 app.use(express.json());
+app.use('/api', (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 
 app.post('/api/login', (req, res) => {
   const ip = req.ip;
