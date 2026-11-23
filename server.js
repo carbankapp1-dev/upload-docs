@@ -87,7 +87,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Não autenticado' });
   res.redirect('/login.html');
 });
-app.get('/api/me', (req, res) => res.json({ user: req.user, cleanupDays: CLEANUP_DAYS, maxFileMb: MAX_FILE_MB }));
+app.all('/api/me', (req, res) => res.json({ user: req.user, cleanupDays: CLEANUP_DAYS, maxFileMb: MAX_FILE_MB }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ---------- Arquivos ----------
@@ -121,9 +121,10 @@ app.post('/api/upload', upload.array('files'), async (req, res) => {
 });
 
 // Lista o conteúdo de uma pasta
-app.get('/api/list', async (req, res) => {
+// Aceita GET e POST: algumas redes corporativas atrapalham GETs feitos pela página
+app.all('/api/list', async (req, res) => {
   try {
-    const dir = clean(req.query.dir);
+    const dir = clean((req.body && req.body.dir) ?? req.query.dir);
     res.json({ dir, items: await store.list(dir) });
   } catch (e) {
     console.error(e);
@@ -162,7 +163,7 @@ app.get('/api/download', async (req, res) => {
 });
 
 // Excluir arquivo ou pasta
-app.delete('/api/delete', async (req, res) => {
+app.all('/api/delete', async (req, res) => {
   const p = clean(req.query.path);
   if (!p) return res.sendStatus(400);
   try {
