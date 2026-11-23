@@ -164,7 +164,7 @@
     <div class="dropzone" id="dropzone">
       <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14.9A7 7 0 1 1 15.7 8h1.8a4.5 4.5 0 0 1 2.5 8.2"/><path d="M12 12v9"/><path d="m16 16-4-4-4 4"/></svg>
       <h2>Arraste arquivos ou pastas aqui</h2>
-      <p>ou escolha abaixo — serão enviados para a pasta atual</p>
+      <p>ou escolha abaixo — serão enviados para a pasta atual (máx. <span id="maxMb">50</span> MB por arquivo)</p>
       <p class="aviso" id="aviso" hidden></p>
       <div class="btns">
         <button class="btn btn-verde" onclick="fileInput.click()">
@@ -237,6 +237,7 @@ fetch('/api/me').then(r => r.ok ? r.json() : (location.href = '/login.html'))
   .then(d => {
     if (!d) return;
     $('userName').textContent = 'Olá, ' + d.user;
+    if (d.maxFileMb) { maxFileMb = d.maxFileMb; $("maxMb").textContent = d.maxFileMb; }
     if (d.cleanupDays > 0) {
       $('aviso').textContent = `Os arquivos são apagados automaticamente após ${d.cleanupDays} dia(s)`;
       $('aviso').hidden = false;
@@ -303,7 +304,11 @@ async function newFolder() {
 
 /* ---------- Upload ---------- */
 // items: [{ file, path }]
+let maxFileMb = 50;
 function uploadItems(items) {
+  const big = items.filter(i => i.file.size > maxFileMb * 1024 * 1024);
+  items = items.filter(i => i.file.size <= maxFileMb * 1024 * 1024);
+  if (big.length) alert(`Estes arquivos passam do limite de ${maxFileMb} MB e não serão enviados:\n\n` + big.map(i => '• ' + i.path).join('\n'));
   if (!items.length) return;
   const fd = new FormData();
   items.forEach(({ file, path }) => { fd.append('paths', path); fd.append('files', file); });
@@ -323,7 +328,12 @@ function uploadItems(items) {
   xhr.onload = () => {
     $('progress').classList.remove('show');
     $('progressBar').style.width = '0';
-    toast(xhr.status === 200 ? `${items.length} arquivo(s) enviado(s)!` : 'Erro no envio');
+    let r = {}; try { r = JSON.parse(xhr.responseText); } catch {}
+    if (xhr.status !== 200) toast('Erro no envio');
+    else if (r.failed && r.failed.length) {
+      toast(`${r.count} enviado(s), ${r.failed.length} com erro`);
+      alert('Não foi possível enviar:\n\n' + r.failed.map(f => '• ' + f).join('\n'));
+    } else toast(`${r.count} arquivo(s) enviado(s)!`);
     load();
   };
   xhr.onerror = () => { $('progress').classList.remove('show'); toast('Erro de conexão'); };

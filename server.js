@@ -5,36 +5,15 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
-const {
-  S3Client, ListObjectsV2Command, HeadObjectCommand, GetObjectCommand,
-  PutObjectCommand, DeleteObjectsCommand,
-} = require('@aws-sdk/client-s3');
-const { Upload } = require('@aws-sdk/lib-storage');
-const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { storeFromEnv, clean, encodePath } = require('./storage');
 
 const PORT = process.env.PORT || 3000;
-
-// ---------- Cloudflare R2 ----------
-const { R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET } = process.env;
-const R2_ENDPOINT = process.env.R2_ENDPOINT || (R2_ACCOUNT_ID && `https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com`);
-if (!R2_ENDPOINT || !R2_ACCESS_KEY_ID || !R2_SECRET_ACCESS_KEY || !R2_BUCKET) {
-  console.error('Configure R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY e R2_BUCKET (veja o README).');
-  process.exit(1);
-}
-const s3 = new S3Client({
-  region: 'auto',
-  endpoint: R2_ENDPOINT,
-  forcePathStyle: true,
-  // Recomendado para o R2: só calcula checksums quando obrigatório
-  requestChecksumCalculation: 'WHEN_REQUIRED',
-  responseChecksumValidation: 'WHEN_REQUIRED',
-  credentials: { accessKeyId: R2_ACCESS_KEY_ID, secretAccessKey: R2_SECRET_ACCESS_KEY },
-});
-const Bucket = R2_BUCKET;
-const KEEP = '.keep'; // marcador para pastas vazias
+const store = storeFromEnv();
 
 // Limpeza automática: apaga arquivos com mais de CLEANUP_DAYS dias (0 desliga)
 const CLEANUP_DAYS = Number(process.env.CLEANUP_DAYS ?? 2);
+// Limite por arquivo. No plano grátis do Supabase o máximo é 50 MB.
+const MAX_FILE_MB = Number(process.env.MAX_FILE_MB || 50);
 
 // ---------- Login ----------
 // Usuários no formato "usuario:senha,outro:senha2" (variável USERS)
@@ -107,55 +86,17 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) return res.status(401).json({ error: 'Não autenticado' });
   res.redirect('/login.html');
 });
-app.get('/api/me', (req, res) => res.json({ user: req.user, cleanupDays: CLEANUP_DAYS }));
+app.get('/api/me', (req, res) => res.json({ user: req.user, cleanupDays: CLEANUP_DAYS, maxFileMb: MAX_FILE_MB }));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// ---------- Helpers de armazenamento ----------
-// Normaliza um caminho relativo ("a/b/c.txt"), bloqueando "../"
-function clean(rel = '') {
-  return String(rel).replace(/\\/g, '/').split('/')
-    .filter(p => p && p !== '.' && p !== '..').join('/');
-}
-const prefixOf = dir => (dir ? dir + '/' : '');
-
-async function exists(Key) {
-  try { await s3.send(new HeadObjectCommand({ Bucket, Key })); return true; }
-  catch (e) { if (e.$metadata?.httpStatusCode === 404 || e.name === 'NotFound') return false; throw e; }
-}
-// Evita sobrescrever: "foto.png" -> "foto (1).png"
-async function uniqueKey(Key) {
-  if (!(await exists(Key))) return Key;
-  const dir = path.posix.dirname(Key), ext = path.posix.extname(Key), name = path.posix.basename(Key, ext);
-  for (let i = 1; ; i++) {
-    const k = (dir === '.' ? '' : dir + '/') + `${name} (${i})${ext}`;
-    if (!(await exists(k))) return k;
-  }
-}
-// Todos os objetos sob um prefixo (com paginação)
-async function listAll(Prefix) {
-  const out = []; let ContinuationToken;
-  do {
-    const r = await s3.send(new ListObjectsV2Command({ Bucket, Prefix, ContinuationToken }));
-    out.push(...(r.Contents || []));
-    ContinuationToken = r.IsTruncated ? r.NextContinuationToken : undefined;
-  } while (ContinuationToken);
-  return out;
-}
-async function deleteKeys(keys) {
-  for (let i = 0; i < keys.length; i += 1000) {
-    await s3.send(new DeleteObjectsCommand({
-      Bucket, Delete: { Objects: keys.slice(i, i + 1000).map(Key => ({ Key })), Quiet: true },
-    }));
-  }
-}
+// ---------- Arquivos ----------
+const upload = multer({ dest: path.join(os.tmpdir(), 'uploads-tmp') });
 const contentDisposition = name =>
   `attachment; filename="${name.replace(/[^\x20-\x7e]|"/g, '_')}"; filename*=UTF-8''${encodeURIComponent(name)}`;
 
-// ---------- Rotas ----------
-const upload = multer({ dest: path.join(os.tmpdir(), 'uploads-tmp'), limits: { fileSize: 5 * 1024 * 1024 * 1024 } });
-
 // Upload: campo "files" + campo "paths" (caminho relativo de cada arquivo, para pastas)
 app.post('/api/upload', upload.array('files'), async (req, res) => {
+  const failed = [];
   try {
     const base = clean(req.query.dir);
     const paths = [].concat(req.body.paths || []);
@@ -163,16 +104,16 @@ app.post('/api/upload', upload.array('files'), async (req, res) => {
       const f = req.files[i];
       const rel = clean(paths[i] || f.originalname);
       if (!rel) continue;
-      const Key = await uniqueKey(prefixOf(base) + rel);
-      await new Upload({
-        client: s3,
-        params: { Bucket, Key, Body: fs.createReadStream(f.path), ContentLength: f.size, ContentType: f.mimetype || 'application/octet-stream' },
-      }).done();
+      if (f.size > MAX_FILE_MB * 1024 * 1024) { failed.push(rel); continue; }
+      try {
+        const body = await fs.promises.readFile(f.path);
+        await store.save((base ? base + '/' : '') + rel, body, f.mimetype || 'application/octet-stream');
+      } catch (e) {
+        console.error('Falha ao enviar', rel, e.message);
+        failed.push(rel);
+      }
     }
-    res.json({ ok: true, count: req.files.length });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Erro ao salvar arquivos' });
+    res.json({ ok: true, count: req.files.length - failed.length, failed });
   } finally {
     (req.files || []).forEach(f => fs.rm(f.path, { force: true }, () => {}));
   }
@@ -182,54 +123,35 @@ app.post('/api/upload', upload.array('files'), async (req, res) => {
 app.get('/api/list', async (req, res) => {
   try {
     const dir = clean(req.query.dir);
-    const Prefix = prefixOf(dir);
-    const items = []; let ContinuationToken;
-    do {
-      const r = await s3.send(new ListObjectsV2Command({ Bucket, Prefix, Delimiter: '/', ContinuationToken }));
-      (r.CommonPrefixes || []).forEach(p =>
-        items.push({ name: p.Prefix.slice(Prefix.length, -1), isDir: true, size: 0, mtime: null }));
-      (r.Contents || []).forEach(o => {
-        const name = o.Key.slice(Prefix.length);
-        if (name && name !== KEEP) items.push({ name, isDir: false, size: o.Size, mtime: +o.LastModified });
-      });
-      ContinuationToken = r.IsTruncated ? r.NextContinuationToken : undefined;
-    } while (ContinuationToken);
-    items.sort((a, b) => (b.isDir - a.isDir) || a.name.localeCompare(b.name, 'pt-BR'));
-    res.json({ dir, items });
+    res.json({ dir, items: await store.list(dir) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Erro ao listar' });
   }
 });
 
-// Download de arquivo (link temporário direto do R2), ou de pasta como .zip
+// Download de arquivo, ou de pasta como .zip
 app.get('/api/download', async (req, res) => {
   const p = clean(req.query.path);
   if (!p) return res.sendStatus(400);
   try {
-    if (await exists(p)) {
-      const url = await getSignedUrl(s3, new GetObjectCommand({
-        Bucket, Key: p, ResponseContentDisposition: contentDisposition(path.posix.basename(p)),
-      }), { expiresIn: 300 });
-      return res.redirect(url);
+    if (await store.isFile(p)) {
+      const { body, type } = await store.downloadFile(p);
+      res.setHeader('Content-Type', type || 'application/octet-stream');
+      res.setHeader('Content-Disposition', contentDisposition(p.split('/').pop()));
+      return res.send(body);
     }
-    const objs = (await listAll(p + '/')).filter(o => path.posix.basename(o.Key) !== KEEP);
-    if (!objs.length) return res.sendStatus(404);
 
-    const folder = path.posix.basename(p);
+    const files = (await store.listAll(encodePath(p))).filter(f => !f.placeholder);
+    if (!files.length) return res.sendStatus(404);
+    const folder = p.split('/').pop();
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', contentDisposition(folder + '.zip'));
     const zip = archiver('zip', { zlib: { level: 6 } });
     zip.on('error', e => { console.error(e); res.end(); });
     zip.pipe(res);
-    // Um arquivo por vez, para não abrir muitas conexões ao R2
-    for (const o of objs) {
-      const { Body } = await s3.send(new GetObjectCommand({ Bucket, Key: o.Key }));
-      await new Promise((resolve, reject) => {
-        zip.once('entry', resolve);
-        Body.once('error', reject);
-        zip.append(Body, { name: folder + '/' + o.Key.slice(p.length + 1), date: o.LastModified });
-      });
+    for (const f of files) {
+      zip.append(await store.download(f.key), { name: folder + '/' + f.rel, date: new Date(f.created) });
     }
     zip.finalize();
   } catch (e) {
@@ -243,9 +165,7 @@ app.delete('/api/delete', async (req, res) => {
   const p = clean(req.query.path);
   if (!p) return res.sendStatus(400);
   try {
-    const keys = (await listAll(p + '/')).map(o => o.Key);
-    if (await exists(p)) keys.push(p);
-    await deleteKeys(keys);
+    await store.remove(p);
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
@@ -253,12 +173,12 @@ app.delete('/api/delete', async (req, res) => {
   }
 });
 
-// Criar pasta (no R2 pastas não existem sozinhas: guardamos um marcador .keep)
+// Criar pasta
 app.post('/api/mkdir', async (req, res) => {
   const p = clean(req.query.path);
   if (!p) return res.sendStatus(400);
   try {
-    await s3.send(new PutObjectCommand({ Bucket, Key: p + '/' + KEEP, Body: '' }));
+    await store.mkdir(p);
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
@@ -266,22 +186,22 @@ app.post('/api/mkdir', async (req, res) => {
   }
 });
 
-// ---------- Limpeza automática ----------
-async function cleanup() {
+// ---------- Manutenção (enquanto o servidor estiver acordado) ----------
+// Quando o site fica parado, quem faz isso é o GitHub Actions (.github/workflows/manutencao.yml)
+async function maintenance() {
   try {
-    const limit = Date.now() - CLEANUP_DAYS * 864e5;
-    const old = (await listAll('')).filter(o => +o.LastModified < limit).map(o => o.Key);
-    if (old.length) {
-      await deleteKeys(old);
-      console.log(`Limpeza: ${old.length} arquivo(s) com mais de ${CLEANUP_DAYS} dia(s) apagado(s).`);
-    }
+    const n = await store.cleanup(CLEANUP_DAYS);
+    if (n) console.log(`Limpeza: ${n} arquivo(s) com mais de ${CLEANUP_DAYS} dia(s) apagado(s).`);
+    await store.keepAlive();
   } catch (e) {
-    console.error('Erro na limpeza:', e.message);
+    console.error('Erro na manutenção:', e.message);
   }
 }
-if (CLEANUP_DAYS > 0) {
-  cleanup();
-  setInterval(cleanup, 60 * 60e3); // verifica a cada hora
-}
 
-app.listen(PORT, () => console.log(`Servidor rodando em http://localhost:${PORT}`));
+store.ensureBucket()
+  .catch(e => console.error('Não consegui verificar/criar o bucket:', e.message))
+  .finally(() => {
+    maintenance();
+    setInterval(maintenance, 60 * 60e3); // a cada hora
+    app.listen(PORT, () => console.log(`Servidor rodando em http://localhost:${PORT}`));
+  });
