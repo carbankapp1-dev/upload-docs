@@ -135,6 +135,33 @@
   }
   .toast.show { transform: translateX(-50%) translateY(0); }
 
+  /* Janela "pode excluir?" */
+  .modal-bg {
+    position: fixed; inset: 0; background: rgba(20, 32, 55, .55); display: none;
+    align-items: center; justify-content: center; padding: 16px; z-index: 20;
+  }
+  .modal-bg.show { display: flex; }
+  .modal {
+    background: #fff; border-radius: 16px; width: 100%; max-width: 420px; padding: 26px 24px 22px;
+    box-shadow: 0 10px 40px rgba(17, 23, 65, .25); text-align: center;
+  }
+  .modal-icon {
+    width: 56px; height: 56px; border-radius: 50%; margin: 0 auto 14px; display: grid; place-items: center;
+    background: rgba(70, 218, 134, .15); color: #23a85c;
+  }
+  .modal h3 { font-size: 1.1rem; color: var(--azul); font-weight: 600; margin-bottom: 6px; }
+  .modal p { font-size: .9rem; color: var(--texto-suave); margin-bottom: 4px; word-break: break-word; }
+  .modal p strong { color: var(--azul-escuro); }
+  .modal-status { display: inline-flex; align-items: center; gap: 8px; font-size: .85rem; margin: 12px 0 20px; padding: 6px 14px; border-radius: 99px; background: var(--fundo); color: var(--texto-suave); }
+  .modal-status.ok { background: rgba(70, 218, 134, .15); color: #1d8f4e; }
+  .modal-status.erro { background: rgba(229, 72, 77, .1); color: var(--perigo); }
+  .spinner { width: 14px; height: 14px; border: 2px solid #c9d1de; border-top-color: var(--verde); border-radius: 50%; animation: gira .8s linear infinite; }
+  @keyframes gira { to { transform: rotate(360deg); } }
+  .modal-btns { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+  .btn-perigo { background: var(--perigo); color: #fff; }
+  .btn-perigo:hover { background: #cf3a3f; }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+
   @media (max-width: 560px) {
     .card { padding: 16px; }
     .file-row { gap: 10px; padding: 10px 4px; }
@@ -206,6 +233,25 @@
 </main>
 
 <div class="toast" id="toast"></div>
+
+<div class="modal-bg" id="dlModal">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="dlTitle">
+    <div class="modal-icon">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+    </div>
+    <h3 id="dlTitle">Download</h3>
+    <p><strong id="dlName"></strong></p>
+    <p>Depois de baixar, você pode excluir do sistema para liberar espaço.</p>
+    <div class="modal-status" id="dlStatus"></div>
+    <div class="modal-btns">
+      <button class="btn btn-claro" id="dlKeep">Manter</button>
+      <button class="btn btn-perigo" id="dlDelete" disabled>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/></svg>
+        <span id="dlDeleteText">Excluir do sistema</span>
+      </button>
+    </div>
+  </div>
+</div>
 
 <script>
 const ICONS = {
@@ -293,7 +339,7 @@ async function load(dir = currentDir, silent = false) {
         <div class="file-meta">${it.isDir ? 'Pasta' : fmtSize(it.size) + ' · ' + fmtDate(it.mtime)}</div>
       </div>
       <div class="actions">
-        <button class="icon-btn" title="${it.isDir ? 'Baixar pasta (.zip)' : 'Baixar'}" data-dl="${p}">${ICONS.download}</button>
+        <button class="icon-btn" title="${it.isDir ? 'Baixar pasta (.zip)' : 'Baixar'}" data-dl="${p}" data-dir="${it.isDir ? 1 : 0}">${ICONS.download}</button>
         <button class="icon-btn del" title="Excluir" data-del="${p}">${ICONS.trash}</button>
       </div>
     </li>`;
@@ -311,7 +357,7 @@ document.addEventListener('click', async e => {
   const open = e.target.closest('[data-open]');
   if (open) return load(open.dataset.open);
   const dl = e.target.closest('[data-dl]');
-  if (dl) { window.location = '/api/download?path=' + encodeURIComponent(dl.dataset.dl); return; }
+  if (dl) { startDownload(dl.dataset.dl, dl.dataset.dir === '1'); return; }
   const del = e.target.closest('[data-del]');
   if (del) {
     const name = del.dataset.del.split('/').pop();
@@ -321,6 +367,79 @@ document.addEventListener('click', async e => {
     load();
   }
 });
+
+/* ---------- Download + "pode excluir?" ---------- */
+let dlTimer = null, dlPath = null;
+function setDlStatus(kind, html) {
+  const el = $('dlStatus');
+  el.className = 'modal-status' + (kind ? ' ' + kind : '');
+  el.innerHTML = html;
+}
+function closeDlModal() {
+  clearTimeout(dlTimer); dlTimer = null; dlPath = null;
+  $('dlModal').classList.remove('show');
+}
+function startDownload(path, isDir) {
+  const token = Date.now().toString(36) + Math.random().toString(36).slice(2);
+  // Baixa por um iframe escondido: a página não sai do lugar
+  const frame = document.createElement('iframe');
+  frame.style.display = 'none';
+  frame.src = '/api/download?path=' + encodeURIComponent(path) + '&token=' + token;
+  document.body.appendChild(frame);
+  setTimeout(() => frame.remove(), 10 * 60e3);
+
+  dlPath = path;
+  const name = path.split('/').pop();
+  $('dlTitle').textContent = isDir ? 'Baixando pasta (.zip)' : 'Baixando arquivo';
+  $('dlName').textContent = name;
+  $('dlDeleteText').textContent = isDir ? 'Excluir pasta do sistema' : 'Excluir do sistema';
+  $('dlDelete').disabled = true;
+  setDlStatus('', '<span class="spinner"></span> Preparando download…');
+  $('dlModal').classList.add('show');
+
+  const started = Date.now();
+  const poll = async () => {
+    if (dlPath !== path) return;
+    let state = 'unknown';
+    try {
+      const r = await fetch('/api/download-status', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token })
+      });
+      if (r.ok) state = (await r.json()).state;
+    } catch {}
+    if (dlPath !== path) return;
+    if (state === 'done') {
+      setDlStatus('ok', '✓ Download concluído');
+      $('dlTitle').textContent = isDir ? 'Pasta baixada (.zip)' : 'Arquivo baixado';
+      $('dlDelete').disabled = false;
+    } else if (state === 'error') {
+      setDlStatus('erro', 'Não foi possível baixar. Feche e tente de novo.');
+    } else if (state === 'unknown' && Date.now() - started > 60e3) {
+      setDlStatus('erro', 'Não consegui confirmar o download. Feche e tente de novo.');
+    } else {
+      dlTimer = setTimeout(poll, 1000);
+    }
+  };
+  dlTimer = setTimeout(poll, 800);
+}
+$('dlKeep').onclick = closeDlModal;
+$('dlModal').addEventListener('click', e => { if (e.target.id === 'dlModal') closeDlModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && $('dlModal').classList.contains('show')) closeDlModal(); });
+$('dlDelete').onclick = async () => {
+  const path = dlPath;
+  $('dlDelete').disabled = true;
+  setDlStatus('', '<span class="spinner"></span> Excluindo…');
+  try {
+    const r = await fetch('/api/delete?path=' + encodeURIComponent(path), { method: 'POST' });
+    if (!r.ok) throw new Error();
+    closeDlModal();
+    toast('Excluído do sistema');
+    load();
+  } catch {
+    setDlStatus('erro', 'Erro ao excluir. Tente de novo.');
+    $('dlDelete').disabled = false;
+  }
+};
 
 async function newFolder() {
   const name = prompt('Nome da nova pasta:');
