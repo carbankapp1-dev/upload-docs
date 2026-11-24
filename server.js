@@ -91,6 +91,26 @@ app.all('/api/me', (req, res) => res.json({ user: req.user, cleanupDays: CLEANUP
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ---------- Arquivos ----------
+// Cada usuário tem a sua própria área: os arquivos ficam em "<usuario>/..." no Supabase
+const userRoot = req => clean(req.user.replace(/[\/\\]/g, '_'));
+const inUser = (req, p) => (p ? userRoot(req) + '/' + p : userRoot(req));
+
+// Acompanha downloads em andamento (para a janela "pode excluir?" saber quando terminou)
+const downloads = new Map(); // token -> { user, state: 'pending' | 'done' | 'error', t }
+function trackDownload(req, res) {
+  const token = String(req.query.token || '').slice(0, 64);
+  if (!token) return;
+  const d = { user: req.user, state: 'pending', t: Date.now() };
+  downloads.set(token, d);
+  res.on('finish', () => { d.state = res.statusCode < 400 ? 'done' : 'error'; });
+  res.on('close', () => { if (!res.writableFinished) d.state = 'error'; });
+}
+app.all('/api/download-status', (req, res) => {
+  const token = String((req.body && req.body.token) || req.query.token || '');
+  const d = downloads.get(token);
+  res.json({ state: d && d.user === req.user ? d.state : 'unknown' });
+});
+
 const upload = multer({ dest: path.join(os.tmpdir(), 'uploads-tmp') });
 const contentDisposition = name =>
   `attachment; filename="${name.replace(/[^\x20-\x7e]|"/g, '_')}"; filename*=UTF-8''${encodeURIComponent(name)}`;
@@ -108,7 +128,7 @@ app.post('/api/upload', upload.array('files'), async (req, res) => {
       if (f.size > MAX_FILE_MB * 1024 * 1024) { failed.push(rel); continue; }
       try {
         const body = await fs.promises.readFile(f.path);
-        await store.save((base ? base + '/' : '') + rel, body, f.mimetype || 'application/octet-stream');
+        await store.save(inUser(req, (base ? base + '/' : '') + rel), body, f.mimetype || 'application/octet-stream');
       } catch (e) {
         console.error('Falha ao enviar', rel, e.message);
         failed.push(rel);
@@ -125,7 +145,7 @@ app.post('/api/upload', upload.array('files'), async (req, res) => {
 app.all('/api/list', async (req, res) => {
   try {
     const dir = clean((req.body && req.body.dir) ?? req.query.dir);
-    res.json({ dir, items: await store.list(dir) });
+    res.json({ dir, items: await store.list(inUser(req, dir)) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Erro ao listar' });
@@ -135,16 +155,18 @@ app.all('/api/list', async (req, res) => {
 // Download de arquivo, ou de pasta como .zip
 app.get('/api/download', async (req, res) => {
   const p = clean(req.query.path);
+  trackDownload(req, res);
   if (!p) return res.sendStatus(400);
+  const full = inUser(req, p);
   try {
-    if (await store.isFile(p)) {
-      const { body, type } = await store.downloadFile(p);
+    if (await store.isFile(full)) {
+      const { body, type } = await store.downloadFile(full);
       res.setHeader('Content-Type', type || 'application/octet-stream');
       res.setHeader('Content-Disposition', contentDisposition(p.split('/').pop()));
       return res.send(body);
     }
 
-    const files = (await store.listAll(encodePath(p))).filter(f => !f.placeholder);
+    const files = (await store.listAll(encodePath(full))).filter(f => !f.placeholder);
     if (!files.length) return res.sendStatus(404);
     const folder = p.split('/').pop();
     res.setHeader('Content-Type', 'application/zip');
@@ -167,7 +189,7 @@ app.all('/api/delete', async (req, res) => {
   const p = clean(req.query.path);
   if (!p) return res.sendStatus(400);
   try {
-    await store.remove(p);
+    await store.remove(inUser(req, p));
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
@@ -180,7 +202,7 @@ app.post('/api/mkdir', async (req, res) => {
   const p = clean(req.query.path);
   if (!p) return res.sendStatus(400);
   try {
-    await store.mkdir(p);
+    await store.mkdir(inUser(req, p));
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
@@ -191,6 +213,7 @@ app.post('/api/mkdir', async (req, res) => {
 // ---------- Manutenção (enquanto o servidor estiver acordado) ----------
 // Quando o site fica parado, quem faz isso é o GitHub Actions (.github/workflows/manutencao.yml)
 async function maintenance() {
+  for (const [k, d] of downloads) if (Date.now() - d.t > 6 * 3600e3) downloads.delete(k);
   try {
     const n = await store.cleanup(CLEANUP_DAYS);
     if (n) console.log(`Limpeza: ${n} arquivo(s) com mais de ${CLEANUP_DAYS} dia(s) apagado(s).`);
