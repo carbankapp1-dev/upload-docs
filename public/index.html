@@ -69,7 +69,7 @@
   .dropzone > svg { color: var(--verde); margin-bottom: 8px; }
   .dropzone h2 { font-size: 1.1rem; color: var(--azul); font-weight: 600; }
   .dropzone p { color: var(--texto-suave); font-size: .9rem; margin: 4px 0 18px; }
-  .aviso { font-size: .8rem !important; color: var(--azul) !important; background: rgba(70, 218, 134, .12); display: inline-block; padding: 4px 12px; border-radius: 99px; margin-top: -8px !important; }
+  .aviso { font-size: .8rem !important; color: var(--azul) !important; background: rgba(70, 218, 134, .12); display: inline-block; padding: 4px 12px; border-radius: 12px; margin-top: -8px !important; }
   .aviso[hidden] { display: none; }
   .btns { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
 
@@ -126,6 +126,20 @@
   .icon-btn:hover { background: var(--verde); border-color: var(--verde); }
   .icon-btn.del:hover { background: var(--perigo); border-color: var(--perigo); color: #fff; }
 
+  /* Caixa "Manter" */
+  .keep {
+    display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 10px;
+    border: 1px solid var(--borda); border-radius: 9px; background: #fff; cursor: pointer;
+    font-size: .8rem; font-weight: 500; color: var(--texto-suave); user-select: none; transition: .15s;
+  }
+  .keep:hover { border-color: var(--verde); }
+  .keep input { width: 16px; height: 16px; accent-color: var(--verde); cursor: pointer; margin: 0; }
+  .keep.on { background: rgba(70, 218, 134, .12); border-color: var(--verde); color: #1d8f4e; }
+  .keep.locked { cursor: default; opacity: .75; }
+  .keep.locked input { cursor: default; }
+  .tag-keep { color: #1d8f4e; font-weight: 500; }
+  .tag-exp { color: var(--texto-suave); }
+
   .empty { text-align: center; padding: 40px 10px; color: var(--texto-suave); }
 
   .toast {
@@ -166,6 +180,8 @@
     .card { padding: 16px; }
     .file-row { gap: 10px; padding: 10px 4px; }
     .icon { width: 34px; height: 34px; }
+    .keep span { display: none; }
+    .keep { padding: 0 9px; }
   }
 </style>
 </head>
@@ -261,7 +277,7 @@ const ICONS = {
   trash: '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>'
 };
 
-let currentDir = '';
+let currentDir = '', cleanupDays = 0;
 const $ = id => document.getElementById(id);
 const fileInput = $('fileInput'), folderInput = $('folderInput');
 
@@ -292,8 +308,10 @@ fetch('/api/me', { method: 'POST' }).then(r => r.ok ? r.json() : (location.href 
     $('userName').textContent = 'Olá, ' + d.user;
     if (d.maxFileMb) { maxFileMb = d.maxFileMb; $("maxMb").textContent = d.maxFileMb; }
     if (d.cleanupDays > 0) {
-      $('aviso').textContent = `Os arquivos são apagados automaticamente após ${d.cleanupDays} dia(s)`;
+      cleanupDays = d.cleanupDays;
+      $('aviso').textContent = `Os arquivos são apagados automaticamente após ${d.cleanupDays} dia(s) — marque "Manter" para guardar por mais tempo`;
       $('aviso').hidden = false;
+      lastList = ''; load(currentDir, true); // redesenha mostrando a data de expiração
     }
   });
 
@@ -332,13 +350,23 @@ async function load(dir = currentDir, silent = false) {
   }
   list.innerHTML = data.items.map(it => {
     const p = esc(join(currentDir, it.name));
+    const kept = it.keep || it.inherited;
+    let status = '';
+    if (cleanupDays > 0) {
+      if (kept) status = ` · <span class="tag-keep">✓ ${it.isDir ? 'mantida' : 'mantido'}</span>`;
+      else if (!it.isDir) status = ` · <span class="tag-exp">expira ${fmtDate(it.mtime + cleanupDays * 864e5)}</span>`;
+    }
+    const keepBox = cleanupDays > 0 ? `<label class="keep ${kept ? 'on' : ''} ${it.inherited ? 'locked' : ''}"
+        title="${it.inherited ? 'Mantido porque a pasta está marcada' : 'Não apagar automaticamente'}">
+        <input type="checkbox" data-keep="${p}" ${kept ? 'checked' : ''} ${it.inherited ? 'disabled' : ''}><span>Manter</span></label>` : '';
     return `<li class="file-row">
       <div class="icon ${it.isDir ? 'dir' : ''}">${it.isDir ? ICONS.folder : ICONS.file}</div>
       <div class="file-info">
         <div class="file-name ${it.isDir ? 'clickable' : ''}" ${it.isDir ? `data-open="${p}"` : ''} title="${esc(it.name)}">${esc(it.name)}</div>
-        <div class="file-meta">${it.isDir ? 'Pasta' : fmtSize(it.size) + ' · ' + fmtDate(it.mtime)}</div>
+        <div class="file-meta">${it.isDir ? 'Pasta' : fmtSize(it.size) + ' · ' + fmtDate(it.mtime)}${status}</div>
       </div>
       <div class="actions">
+        ${keepBox}
         <button class="icon-btn" title="${it.isDir ? 'Baixar pasta (.zip)' : 'Baixar'}" data-dl="${p}" data-dir="${it.isDir ? 1 : 0}">${ICONS.download}</button>
         <button class="icon-btn del" title="Excluir" data-del="${p}">${ICONS.trash}</button>
       </div>
@@ -366,6 +394,25 @@ document.addEventListener('click', async e => {
     toast('Excluído com sucesso');
     load();
   }
+});
+
+document.addEventListener('change', async e => {
+  const box = e.target.closest('[data-keep]');
+  if (!box) return;
+  const keep = box.checked;
+  box.disabled = true;
+  try {
+    const r = await fetch('/api/protect', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: box.dataset.keep, keep })
+    });
+    if (!r.ok) throw new Error();
+    toast(keep ? 'Será mantido (não apaga automaticamente)' : `Volta a ser apagado após ${cleanupDays} dia(s)`);
+  } catch {
+    box.checked = !keep;
+    toast('Erro ao salvar. Tente de novo.');
+  }
+  load();
 });
 
 /* ---------- Download + "pode excluir?" ---------- */

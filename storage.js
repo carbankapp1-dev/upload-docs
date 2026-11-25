@@ -3,6 +3,9 @@ const { createClient } = require('@supabase/supabase-js');
 
 const PLACEHOLDER = '.emptyFolderPlaceholder'; // mesmo marcador que o painel do Supabase usa para pastas vazias
 const PAGE = 1000;
+// Lista de itens marcados como "Manter" (um arquivo por usuário, na raiz da área dele).
+// O "@" solto nunca aparece em nomes de usuários (eles viram "@40;"), então não há conflito.
+const PROTECT_FILE = '.protegidos@.json';
 
 // O Supabase não aceita acentos e vários símbolos no nome dos arquivos.
 // Então codificamos: "café.txt" vira "caf@e9;.txt" lá dentro, e o site mostra o nome original.
@@ -43,7 +46,7 @@ function createStore({ url, key, bucket = 'arquivos', client } = {}) {
   // Lista para o site: [{ name, isDir, size, mtime }]
   async function list(dir) {
     const items = (await listRaw(encodePath(dir)))
-      .filter(o => o.name !== PLACEHOLDER)
+      .filter(o => o.name !== PLACEHOLDER && o.name !== PROTECT_FILE)
       .map(o => o.id == null
         ? { name: decodeSeg(o.name), isDir: true, size: 0, mtime: null }
         : { name: decodeSeg(o.name), isDir: false, size: o.metadata?.size ?? 0, mtime: Date.parse(o.created_at || o.updated_at) });
@@ -109,10 +112,39 @@ function createStore({ url, key, bucket = 'arquivos', client } = {}) {
   }
 
   // Apaga arquivos com mais de `days` dias. Retorna quantos apagou.
+  // ---- Itens marcados como "Manter" ----
+  // root = área do usuário (caminho normal, ex.: "maria"); paths = caminhos dentro dela
+  async function getProtected(root) {
+    const { data, error } = await b().download(encodePath(root) + '/' + PROTECT_FILE);
+    if (error || !data) return new Set();
+    try { return new Set(JSON.parse(await data.text()).paths || []); } catch { return new Set(); }
+  }
+  async function setProtected(root, set) {
+    const body = Buffer.from(JSON.stringify({ paths: [...set].sort() }));
+    must(await b().upload(encodePath(root) + '/' + PROTECT_FILE, body, { upsert: true, contentType: 'application/json' }));
+  }
+
+  // Apaga arquivos com mais de `days` dias, exceto os marcados como "Manter". Retorna quantos apagou.
   async function cleanup(days) {
     if (!(days > 0)) return 0;
     const limit = Date.now() - days * 864e5;
-    const old = (await listAll('')).filter(o => o.created < limit).map(o => o.key);
+    const all = await listAll('');
+    // Carrega a lista "Manter" de cada usuário
+    const protectedBy = {};
+    for (const o of all) {
+      const parts = o.rel.split('/');
+      if (parts.length === 2 && parts[1] === PROTECT_FILE) protectedBy[parts[0]] = await getProtected(parts[0]);
+    }
+    const old = all.filter(o => {
+      if (o.created >= limit) return false;
+      const parts = o.rel.split('/');
+      if (parts[parts.length - 1] === PROTECT_FILE) return false;
+      const set = protectedBy[parts[0]];
+      if (!set || parts.length < 2) return true;
+      const inside = parts.slice(1);
+      for (let i = 1; i <= inside.length; i++) if (set.has(inside.slice(0, i).join('/'))) return false;
+      return true;
+    }).map(o => o.key);
     await removeKeys(old);
     return old.length;
   }
@@ -125,7 +157,7 @@ function createStore({ url, key, bucket = 'arquivos', client } = {}) {
     }
   }
 
-  return { ensureBucket, list, listAll, save, isFile, download, downloadFile, remove, mkdir, cleanup, keepAlive };
+  return { ensureBucket, list, listAll, save, isFile, download, downloadFile, remove, mkdir, cleanup, keepAlive, getProtected, setProtected };
 }
 
 function storeFromEnv() {

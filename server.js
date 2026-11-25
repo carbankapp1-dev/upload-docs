@@ -145,7 +145,16 @@ app.post('/api/upload', upload.array('files'), async (req, res) => {
 app.all('/api/list', async (req, res) => {
   try {
     const dir = clean((req.body && req.body.dir) ?? req.query.dir);
-    res.json({ dir, items: await store.list(inUser(req, dir)) });
+    const [items, prot] = await Promise.all([store.list(inUser(req, dir)), store.getProtected(userRoot(req))]);
+    // A pasta atual (ou alguma acima dela) está marcada como "Manter"?
+    const parts = dir ? dir.split('/') : [];
+    let inherited = false;
+    for (let i = 1; i <= parts.length; i++) if (prot.has(parts.slice(0, i).join('/'))) inherited = true;
+    items.forEach(it => {
+      it.keep = prot.has(dir ? dir + '/' + it.name : it.name);
+      it.inherited = inherited;
+    });
+    res.json({ dir, items, inherited });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Erro ao listar' });
@@ -190,10 +199,29 @@ app.all('/api/delete', async (req, res) => {
   if (!p) return res.sendStatus(400);
   try {
     await store.remove(inUser(req, p));
+    const prot = await store.getProtected(userRoot(req));
+    const before = prot.size;
+    for (const k of [...prot]) if (k === p || k.startsWith(p + '/')) prot.delete(k);
+    if (prot.size !== before) await store.setProtected(userRoot(req), prot);
     res.json({ ok: true });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: 'Erro ao excluir' });
+  }
+});
+
+// Marcar/desmarcar "Manter" (não apagar automaticamente)
+app.post('/api/protect', async (req, res) => {
+  const p = clean(req.body && req.body.path);
+  if (!p) return res.sendStatus(400);
+  try {
+    const prot = await store.getProtected(userRoot(req));
+    if (req.body.keep) prot.add(p); else prot.delete(p);
+    await store.setProtected(userRoot(req), prot);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erro ao salvar' });
   }
 });
 
