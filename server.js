@@ -225,6 +225,22 @@ app.post('/api/protect', async (req, res) => {
   }
 });
 
+// Bloco de notas (um por usuário)
+const NOTE_MAX = 20000; // caracteres
+app.post('/api/note', async (req, res) => {
+  try {
+    if (req.body && typeof req.body.text === 'string') {
+      const text = req.body.text.slice(0, NOTE_MAX);
+      const saved = await store.setNote(userRoot(req), text.trim() ? text : '');
+      return res.json({ ok: true, saved });
+    }
+    res.json(await store.getNote(userRoot(req)));
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Erro no bloco de notas' });
+  }
+});
+
 // Criar pasta
 app.post('/api/mkdir', async (req, res) => {
   const p = clean(req.query.path);

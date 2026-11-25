@@ -6,6 +6,8 @@ const PAGE = 1000;
 // Lista de itens marcados como "Manter" (um arquivo por usuário, na raiz da área dele).
 // O "@" solto nunca aparece em nomes de usuários (eles viram "@40;"), então não há conflito.
 const PROTECT_FILE = '.protegidos@.json';
+const NOTE_FILE = '.nota@.json'; // bloco de notas do usuário
+const INTERNAL = new Set([PROTECT_FILE, NOTE_FILE]); // arquivos internos: não aparecem na lista e não são apagados
 
 // O Supabase não aceita acentos e vários símbolos no nome dos arquivos.
 // Então codificamos: "café.txt" vira "caf@e9;.txt" lá dentro, e o site mostra o nome original.
@@ -46,7 +48,7 @@ function createStore({ url, key, bucket = 'arquivos', client } = {}) {
   // Lista para o site: [{ name, isDir, size, mtime }]
   async function list(dir) {
     const items = (await listRaw(encodePath(dir)))
-      .filter(o => o.name !== PLACEHOLDER && o.name !== PROTECT_FILE)
+      .filter(o => o.name !== PLACEHOLDER && !INTERNAL.has(o.name))
       .map(o => o.id == null
         ? { name: decodeSeg(o.name), isDir: true, size: 0, mtime: null }
         : { name: decodeSeg(o.name), isDir: false, size: o.metadata?.size ?? 0, mtime: Date.parse(o.created_at || o.updated_at) });
@@ -111,6 +113,21 @@ function createStore({ url, key, bucket = 'arquivos', client } = {}) {
     if (error) throw error;
   }
 
+  // ---- Bloco de notas ----
+  async function getNote(root) {
+    const { data, error } = await b().download(encodePath(root) + '/' + NOTE_FILE);
+    if (error || !data) return { text: '', saved: null };
+    try { const j = JSON.parse(await data.text()); return { text: j.text || '', saved: j.saved || null }; }
+    catch { return { text: '', saved: null }; }
+  }
+  async function setNote(root, text) {
+    const key = encodePath(root) + '/' + NOTE_FILE;
+    if (!text) { must(await b().remove([key])); return null; }
+    const saved = Date.now();
+    must(await b().upload(key, Buffer.from(JSON.stringify({ text, saved })), { upsert: true, contentType: 'application/json' }));
+    return saved;
+  }
+
   // Apaga arquivos com mais de `days` dias. Retorna quantos apagou.
   // ---- Itens marcados como "Manter" ----
   // root = área do usuário (caminho normal, ex.: "maria"); paths = caminhos dentro dela
@@ -138,7 +155,7 @@ function createStore({ url, key, bucket = 'arquivos', client } = {}) {
     const old = all.filter(o => {
       if (o.created >= limit) return false;
       const parts = o.rel.split('/');
-      if (parts[parts.length - 1] === PROTECT_FILE) return false;
+      if (INTERNAL.has(parts[parts.length - 1])) return false;
       const set = protectedBy[parts[0]];
       if (!set || parts.length < 2) return true;
       const inside = parts.slice(1);
@@ -157,7 +174,7 @@ function createStore({ url, key, bucket = 'arquivos', client } = {}) {
     }
   }
 
-  return { ensureBucket, list, listAll, save, isFile, download, downloadFile, remove, mkdir, cleanup, keepAlive, getProtected, setProtected };
+  return { ensureBucket, list, listAll, save, isFile, download, downloadFile, remove, mkdir, cleanup, keepAlive, getProtected, setProtected, getNote, setNote };
 }
 
 function storeFromEnv() {
